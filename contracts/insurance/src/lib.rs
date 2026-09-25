@@ -44,6 +44,8 @@ const SECS_PER_DAY: u64 = 86_400;
 
 const INSTANCE_LIFETIME_THRESHOLD: u32 = 17_280 * 30; // ~30 days at 5s/ledger
 const INSTANCE_BUMP_AMOUNT: u32 = 17_280 * 60; // ~60 days
+const PERSISTENT_LIFETIME_THRESHOLD: u32 = 17_280 * 30; // ~30 days at 5s/ledger
+const PERSISTENT_BUMP_AMOUNT: u32 = 17_280 * 60; // ~60 days
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -233,6 +235,7 @@ pub struct CreditScoreData {
 #[contractclient(name = "InvoiceContractClient")]
 pub trait InvoiceContract {
     fn is_invoice_defaulted(env: Env, id: u64) -> bool;
+    fn get_invoice_verification_state(env: Env, id: u64) -> (bool, i128);
 }
 
 #[contractclient(name = "PoolContractClient")]
@@ -427,9 +430,11 @@ impl InsuranceReserve {
         }
         let mut reserve = Self::load_reserve(&env, &token);
         reserve.min_coverage_ratio_bps = min_ratio_bps;
+        let key = DataKey::ReserveFund(token.clone());
         env.storage()
-            .instance()
-            .set(&DataKey::ReserveFund(token.clone()), &reserve);
+            .persistent()
+            .set(&key, &reserve);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         env.events().publish(
             (EVT, symbol_short!("mcr_set")),
             (admin, token, min_ratio_bps),
@@ -480,9 +485,11 @@ impl InsuranceReserve {
                 .checked_add(amount)
                 .ok_or(InsuranceError::AmountOverflow)?;
             Self::recompute_ratio(&mut reserve);
+            let key = DataKey::ReserveFund(token.clone());
             env.storage()
-                .instance()
-                .set(&DataKey::ReserveFund(token.clone()), &reserve);
+                .persistent()
+                .set(&key, &reserve);
+            env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
             env.events()
                 .publish((EVT, symbol_short!("funded")), (admin, token, amount));
@@ -540,10 +547,15 @@ impl InsuranceReserve {
         if principal <= 0 {
             return Err(InsuranceError::InvalidAmount);
         }
+
+        let invoice_client = InvoiceContractClient::new(&env, &config.invoice_contract);
+        let _ = invoice_client.get_invoice_verification_state(&invoice_id);
+
         if env
             .storage()
-            .instance()
-            .has(&DataKey::CoverageRecord(invoice_id))
+            .persistent()
+            .get::<_, CoverageRecord>(&DataKey::CoverageRecord(invoice_id))
+            .is_some()
         {
             return Err(InsuranceError::AlreadyCovered);
         }
@@ -612,9 +624,11 @@ impl InsuranceReserve {
                 .ok_or(InsuranceError::AmountOverflow)?;
             reserve.total_covered_exposure = new_exposure;
             Self::recompute_ratio(&mut reserve);
+            let reserve_key = DataKey::ReserveFund(token.clone());
             env.storage()
-                .instance()
-                .set(&DataKey::ReserveFund(token.clone()), &reserve);
+                .persistent()
+                .set(&reserve_key, &reserve);
+            env.storage().persistent().extend_ttl(&reserve_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
             let record = CoverageRecord {
                 invoice_id,
@@ -625,9 +639,11 @@ impl InsuranceReserve {
                 purchased_at: env.ledger().timestamp(),
                 claimed: false,
             };
+            let record_key = DataKey::CoverageRecord(invoice_id);
             env.storage()
-                .instance()
-                .set(&DataKey::CoverageRecord(invoice_id), &record);
+                .persistent()
+                .set(&record_key, &record);
+            env.storage().persistent().extend_ttl(&record_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
             env.events().publish(
                 (EVT, symbol_short!("covered")),
@@ -647,14 +663,13 @@ impl InsuranceReserve {
         bump_instance(&env);
         require_not_paused(&env)?;
 
-        let mut record: CoverageRecord = env
+        let record: CoverageRecord = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::CoverageRecord(invoice_id))
             .ok_or(InsuranceError::NoCoverageFound)?;
-        if record.claimed {
-            return Err(InsuranceError::AlreadyClaimed);
-        }
+        let record_key = DataKey::CoverageRecord(invoice_id);
+        env.storage().persistent().extend_ttl(&record_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
         let cfg: Config = env
             .storage()
@@ -740,19 +755,15 @@ impl InsuranceReserve {
                 .unwrap_or(0)
                 .max(0);
             Self::recompute_ratio(&mut reserve);
+            let reserve_key = DataKey::ReserveFund(record.token.clone());
             env.storage()
-                .instance()
-                .set(&DataKey::ReserveFund(record.token.clone()), &reserve);
+                .persistent()
+                .set(&reserve_key, &reserve);
+            env.storage().persistent().extend_ttl(&reserve_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
-            record.claimed = true;
-            env.storage()
-                .instance()
-                .set(&DataKey::CoverageRecord(invoice_id), &record);
-
-            // #937: persist claim history entry so callers can audit past claims.
             let hist_count: u32 = env
                 .storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::ClaimHistoryCount(invoice_id))
                 .unwrap_or(0);
             let item = ClaimHistoryItem {
@@ -762,14 +773,19 @@ impl InsuranceReserve {
                 shortfalls: shortfall,
                 timestamp: env.ledger().timestamp(),
             };
-            env.storage().instance().set(
-                &DataKey::ClaimHistoryEntry(invoice_id, hist_count),
+            let hist_key = DataKey::ClaimHistoryEntry(invoice_id, hist_count);
+            env.storage().persistent().set(
+                &hist_key,
                 &item,
             );
-            env.storage().instance().set(
-                &DataKey::ClaimHistoryCount(invoice_id),
+            env.storage().persistent().extend_ttl(&hist_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+            let count_key = DataKey::ClaimHistoryCount(invoice_id);
+            env.storage().persistent().set(
+                &count_key,
                 &(hist_count + 1),
             );
+            env.storage().persistent().extend_ttl(&count_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
             env.events()
                 .publish((EVT, symbol_short!("claimed")), (invoice_id, payout));
@@ -785,7 +801,7 @@ impl InsuranceReserve {
 
     pub fn get_coverage_record(env: Env, invoice_id: u64) -> Option<CoverageRecord> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::CoverageRecord(invoice_id))
     }
 
@@ -793,7 +809,7 @@ impl InsuranceReserve {
     pub fn get_claim_history(env: Env, invoice_id: u64) -> Vec<ClaimHistoryItem> {
         let count: u32 = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::ClaimHistoryCount(invoice_id))
             .unwrap_or(0);
         let mut items = Vec::new(&env);
@@ -801,7 +817,7 @@ impl InsuranceReserve {
         while i < count {
             if let Some(item) = env
                 .storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::ClaimHistoryEntry(invoice_id, i))
             {
                 items.push_back(item);
@@ -817,7 +833,7 @@ impl InsuranceReserve {
         let reserve = Self::load_reserve(&env, &token);
         let min_amount: i128 = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::MinReserveAmount(token.clone()))
             .unwrap_or(0);
         // With no configured floor there is no minimum for the reserve to
@@ -849,9 +865,11 @@ impl InsuranceReserve {
         if min_amount < 0 {
             return Err(InsuranceError::InvalidAmount);
         }
+        let key = DataKey::MinReserveAmount(token.clone());
         env.storage()
-            .instance()
-            .set(&DataKey::MinReserveAmount(token.clone()), &min_amount);
+            .persistent()
+            .set(&key, &min_amount);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         env.events().publish(
             (EVT, symbol_short!("min_rsv")),
             (admin, token, min_amount),
@@ -861,7 +879,7 @@ impl InsuranceReserve {
 
     pub fn get_min_reserve_amount(env: Env, token: Address) -> i128 {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::MinReserveAmount(token))
             .unwrap_or(0)
     }
@@ -919,7 +937,7 @@ impl InsuranceReserve {
 
     fn load_reserve(env: &Env, token: &Address) -> ReserveFund {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::ReserveFund(token.clone()))
             .unwrap_or_default()
     }
